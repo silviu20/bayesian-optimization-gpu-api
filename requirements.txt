@@ -1,0 +1,18 @@
+fastapi==0.103.1
+uvicorn==0.23.2
+pandas==2.1.0
+numpy==1.25.2
+baybe==0.12.2
+pydantic==2.3.0
+python-dotenv==1.0.0
+# For CUDA support - this will install the CUDA-enabled version by default
+# If no CUDA is available, it will fall back to CPU
+torch==2.1.0
+scikit-learn==1.3.0
+gpytorch==1.11.0
+botorch==0.9.3
+matplotlib==3.7.3
+requests==2.31.0
+# For diagnostics
+psutil==5.9.5
+nvidia-ml-py3==7.352.0
