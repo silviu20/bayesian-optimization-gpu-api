@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Test client for the Bayesian Optimization API, demonstrating real-world usage.
-This example optimizes a simulated chemistry reaction with multiple parameters.
+This example optimizes a simulated chemistry reaction with multiple parameters
+and includes constraints on the parameter space.
 """
 
 import requests
@@ -11,7 +12,7 @@ import time
 import matplotlib.pyplot as plt
 import numpy as np
 from pprint import pprint
-from typing import Dict, List, Any, Tuple
+from typing import Dict, List, Any, Tuple, Optional
 
 API_URL = "http://localhost:8000"
 API_KEY = "123456789"  # Same as in .env file
@@ -44,9 +45,9 @@ def test_health():
         print(f"Health check error: {e}")
         return False
 
-# Function to create an optimization campaign
-def create_optimization(optimizer_id: str) -> bool:
-    """Create a chemical reaction optimization with multiple parameters."""
+# Function to create an optimization campaign with constraints
+def create_optimization(optimizer_id: str, use_constraints: bool = True) -> bool:
+    """Create a chemical reaction optimization with multiple parameters and constraints."""
     payload = {
         "parameters": [
             {
@@ -90,6 +91,60 @@ def create_optimization(optimizer_id: str) -> bool:
             "n_raw_samples": 128
         }
     }
+    
+    # Add constraints if enabled
+    if use_constraints:
+                    # Define constraints using BayBE's constraint system
+        payload["constraints"] = [
+            # Temperature pressure constraint using ContinuousLinearConstraint
+            # This is encoded as: Temperature/120 + Pressure/5 <= 1.7
+            {
+                "type": "ContinuousLinear",
+                "parameters": ["Temperature", "Pressure"],
+                "operator": "<=",
+                "coefficients": [1/120, 1/5],
+                "rhs": 1.7
+            },
+            
+            # Water-solvent temperature constraint
+            # Using DiscreteExcludeConstraint with ThresholdCondition
+            {
+                "type": "DiscreteExclude",
+                "parameters": ["Temperature", "Solvent"],
+                "conditions": [
+                    {
+                        "type": "Threshold",
+                        "threshold": 100,
+                        "operator": ">="
+                    },
+                    {
+                        "type": "SubSelection",
+                        "selection": ["Water"]
+                    }
+                ],
+                "combiner": "AND"
+            },
+            
+            # Constraint: If temperature < 80, then time must be >= 60
+            # Using DiscreteExcludeConstraint to exclude invalid combinations
+            {
+                "type": "DiscreteExclude",
+                "parameters": ["Temperature", "Time"],
+                "conditions": [
+                    {
+                        "type": "Threshold",
+                        "threshold": 80,
+                        "operator": "<"
+                    },
+                    {
+                        "type": "Threshold",
+                        "threshold": 60,
+                        "operator": "<"
+                    }
+                ],
+                "combiner": "AND"
+            }
+        ]
 
     try:
         response = requests.post(
@@ -103,6 +158,11 @@ def create_optimization(optimizer_id: str) -> bool:
             print("Optimization created successfully!")
             result = response.json()
             pprint(result)
+            
+            # Print constraint information if available
+            if use_constraints and "constraint_count" in result:
+                print(f"\nApplied {result['constraint_count']} constraints to the search space")
+            
             return True
         else:
             print(f"Error: {response.text}")
@@ -238,19 +298,31 @@ def get_best_point(optimizer_id: str) -> Dict:
         return {}
 
 # Function to add initial measurements
-def add_initial_measurements(optimizer_id: str, num_initial: int = 5) -> List[Dict]:
+def add_initial_measurements(optimizer_id: str, num_initial: int = 5, with_constraints: bool = True) -> List[Dict]:
     """Add initial measurements to bootstrap the Bayesian optimization."""
     print(f"\n=== Adding {num_initial} Initial Measurements ===\n")
     initial_experiments = []
     
     # Define some diverse initial points to explore the parameter space
-    initial_params = [
-        {"Temperature": 70, "Pressure": 2.0, "Time": 60, "Catalyst": "B", "Solvent": "Ethanol"},
-        {"Temperature": 90, "Pressure": 3.0, "Time": 90, "Catalyst": "C", "Solvent": "Acetone"},
-        {"Temperature": 50, "Pressure": 1.5, "Time": 45, "Catalyst": "A", "Solvent": "Water"},
-        {"Temperature": 110, "Pressure": 4.0, "Time": 120, "Catalyst": "E", "Solvent": "THF"},
-        {"Temperature": 80, "Pressure": 2.5, "Time": 75, "Catalyst": "D", "Solvent": "Methanol"}
-    ]
+    # Modified to respect constraints if enabled
+    if with_constraints:
+        initial_params = [
+            {"Temperature": 70, "Pressure": 2.0, "Time": 60, "Catalyst": "B", "Solvent": "Ethanol"},
+            {"Temperature": 90, "Pressure": 3.0, "Time": 90, "Catalyst": "C", "Solvent": "Acetone"},
+            # Water with lower temperature to respect constraints
+            {"Temperature": 50, "Pressure": 1.5, "Time": 75, "Catalyst": "A", "Solvent": "Water"},
+            # Lower pressure with high temperature to respect constraints
+            {"Temperature": 110, "Pressure": 2.5, "Time": 120, "Catalyst": "E", "Solvent": "THF"},
+            {"Temperature": 80, "Pressure": 2.5, "Time": 75, "Catalyst": "D", "Solvent": "Methanol"}
+        ]
+    else:
+        initial_params = [
+            {"Temperature": 70, "Pressure": 2.0, "Time": 60, "Catalyst": "B", "Solvent": "Ethanol"},
+            {"Temperature": 90, "Pressure": 3.0, "Time": 90, "Catalyst": "C", "Solvent": "Acetone"},
+            {"Temperature": 50, "Pressure": 1.5, "Time": 45, "Catalyst": "A", "Solvent": "Water"},
+            {"Temperature": 110, "Pressure": 4.0, "Time": 120, "Catalyst": "E", "Solvent": "THF"},
+            {"Temperature": 80, "Pressure": 2.5, "Time": 75, "Catalyst": "D", "Solvent": "Methanol"}
+        ]
     
     # Use as many points as requested (but not more than available)
     for i in range(min(num_initial, len(initial_params))):
@@ -264,6 +336,29 @@ def add_initial_measurements(optimizer_id: str, num_initial: int = 5) -> List[Di
         reaction_time = params["Time"]
         catalyst = params["Catalyst"]
         solvent = params["Solvent"]
+        
+        # Check if this point respects constraints (when constraints are enabled)
+        if with_constraints:
+            # Manual verification of constraints for demonstration
+            constraints_ok = True
+            
+            # Check temperature/pressure constraint
+            if temperature/120 + pressure/5 > 1.7:
+                print(f"WARNING: Point violates temperature-pressure constraint")
+                constraints_ok = False
+                
+            # Check water-temperature constraint  
+            if solvent == "Water" and temperature >= 100:
+                print(f"WARNING: Point violates water-temperature constraint")
+                constraints_ok = False
+                
+            # Check temperature-time constraint
+            if temperature < 80 and reaction_time < 60:
+                print(f"WARNING: Point violates temperature-time constraint")
+                constraints_ok = False
+                
+            if not constraints_ok:
+                print(f"This point violates constraints but will be used for demonstration purposes.")
         
         yield_value = simulate_yield(temperature, pressure, reaction_time, catalyst, solvent)
         print(f"Measured yield: {yield_value:.2f}%")
@@ -291,9 +386,11 @@ def add_initial_measurements(optimizer_id: str, num_initial: int = 5) -> List[Di
     return initial_experiments
 
 # Function to run the optimization loop
-def run_optimization(optimizer_id: str, num_iterations: int = 20, initial_experiments: List[Dict] = None) -> List[Dict]:
+def run_optimization(optimizer_id: str, num_iterations: int = 20, initial_experiments: List[Dict] = None,
+                     with_constraints: bool = True) -> List[Dict]:
     print(f"\n=== Running {num_iterations} Bayesian Optimization Iterations ===\n")
     all_experiments = initial_experiments or []
+    constraint_violations = 0
     
     # Start iteration count after initial experiments
     start_iteration = len(all_experiments) + 1
@@ -318,6 +415,28 @@ def run_optimization(optimizer_id: str, num_iterations: int = 20, initial_experi
         catalyst = params["Catalyst"]
         solvent = params["Solvent"]
         
+        # Check if this recommendation respects constraints (for verification purposes)
+        if with_constraints:
+            constraints_ok = True
+            
+            # Check temperature/pressure constraint
+            if temperature/120 + pressure/5 > 1.7:
+                print(f"WARNING: Recommendation violates temperature-pressure constraint")
+                constraints_ok = False
+                
+            # Check water-temperature constraint  
+            if solvent == "Water" and temperature >= 100:
+                print(f"WARNING: Recommendation violates water-temperature constraint")
+                constraints_ok = False
+                
+            # Check temperature-time constraint
+            if temperature < 80 and reaction_time < 60:
+                print(f"WARNING: Recommendation violates temperature-time constraint")
+                constraints_ok = False
+                
+            if not constraints_ok:
+                constraint_violations += 1
+        
         yield_value = simulate_yield(temperature, pressure, reaction_time, catalyst, solvent)
         print(f"Measured yield: {yield_value:.2f}%")
         
@@ -341,10 +460,17 @@ def run_optimization(optimizer_id: str, num_iterations: int = 20, initial_experi
         # Add a small delay to avoid hammering the API
         time.sleep(0.2)
     
+    if with_constraints:
+        print(f"\nConstraint violations detected in recommendations: {constraint_violations}/{num_iterations}")
+        if constraint_violations > 0:
+            print("Note: Violations might indicate issues with constraint implementation")
+        else:
+            print("Success! All recommendations satisfied the defined constraints")
+    
     return all_experiments
 
 # Function to plot the optimization results
-def plot_results(experiments: List[Dict]):
+def plot_results(experiments: List[Dict], with_constraints: bool = True):
     # Extract data for plotting
     iterations = [exp["iteration"] for exp in experiments]
     yields = [exp["yield"] for exp in experiments]
@@ -352,8 +478,11 @@ def plot_results(experiments: List[Dict]):
     # Calculate best yield at each iteration (cumulative max)
     best_yields = [max(yields[:i+1]) for i in range(len(yields))]
     
-    # Create figure with two subplots
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+    # Create figure with three subplots if using constraints
+    if with_constraints:
+        fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
+    else:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
     
     # Plot 1: Yield vs. Iteration
     ax1.plot(iterations, yields, 'o-', color='blue', label='Measured Yield')
@@ -385,51 +514,221 @@ def plot_results(experiments: List[Dict]):
     ax2.grid(True, linestyle='--', alpha=0.7)
     ax2.legend()
     
+    # Plot 3: Constraint visualization (if using constraints)
+    if with_constraints:
+        # Create a temperature-pressure plot to visualize the first constraint
+        temps = [exp["temperature"] for exp in experiments]
+        pressures = [exp["pressure"] for exp in experiments]
+        
+        # Create background grid for constraint visualization
+        temp_grid = np.linspace(50, 120, 100)
+        press_grid = np.linspace(1.0, 5.0, 100)
+        T, P = np.meshgrid(temp_grid, press_grid)
+        
+        # Constraint 1: Temperature/120 + Pressure/5 <= 1.7
+        Z = T/120 + P/5
+        constraint_mask = (Z <= 1.7)
+        
+        # Plot the constraint boundary
+        ax3.contourf(T, P, Z, levels=[0, 1.7, 3], alpha=0.3, 
+                     colors=['lightgreen', 'lightcoral'])
+        ax3.contour(T, P, Z, levels=[1.7], colors=['red'], linewidths=2)
+        
+        # Plot the data points
+        solvent_colors = {'Water': 'blue', 'Methanol': 'green', 'Ethanol': 'purple', 
+                          'Acetone': 'orange', 'THF': 'brown'}
+        
+        for i, exp in enumerate(experiments):
+            color = solvent_colors[exp['solvent']]
+            marker = 'o' if exp['temperature'] >= 80 or exp['time'] >= 60 else 'X'
+            
+            # Check if this point satisfies constraint 1
+            constraint1_ok = (exp['temperature']/120 + exp['pressure']/5 <= 1.7)
+            
+            # Use different edge colors based on constraint satisfaction
+            edgecolor = 'black' if constraint1_ok else 'red'
+            linewidth = 1 if constraint1_ok else 2
+            
+            ax3.scatter(exp['temperature'], exp['pressure'], 
+                       color=color, marker=marker, s=80, 
+                       edgecolor=edgecolor, linewidth=linewidth,
+                       alpha=0.7)
+            
+            # Add iteration number as text
+            ax3.annotate(str(exp['iteration']), 
+                        (exp['temperature'], exp['pressure']),
+                        xytext=(5, 5), textcoords='offset points',
+                        fontsize=8)
+            
+        # Add legend for solvents
+        for solvent, color in solvent_colors.items():
+            ax3.scatter([], [], color=color, label=solvent)
+            
+        # Add legend for constraint satisfaction
+        ax3.scatter([], [], color='white', edgecolor='black', label='Constraints OK')
+        ax3.scatter([], [], color='white', edgecolor='red', linewidth=2, label='Constraint violated')
+        
+        ax3.set_xlabel('Temperature (°C)')
+        ax3.set_ylabel('Pressure (bar)')
+        ax3.set_title('Temperature-Pressure Space\nwith Constraint Visualization')
+        ax3.grid(True, linestyle='--', alpha=0.7)
+        ax3.legend(loc='upper right', fontsize=8)
+        
+        # Add annotations explaining the constraint regions
+        ax3.text(60, 4.5, "Valid Region\n(T/120 + P/5 <= 1.7)", 
+                color='darkgreen', fontsize=9, ha='left')
+        ax3.text(110, 4.5, "Invalid Region\n(T/120 + P/5 > 1.7)", 
+                color='darkred', fontsize=9, ha='right')
+    
     # Adjust layout and save
     plt.tight_layout()
-    plt.savefig('optimization_results.png')
-    print("Results plot saved as 'optimization_results.png'")
+    filename = 'constrained_optimization_results.png' if with_constraints else 'optimization_results.png'
+    plt.savefig(filename)
+    print(f"Results plot saved as '{filename}'")
     plt.show()
+
+# Function to run comparative experiments with and without constraints
+def run_comparative_experiment():
+    # Generate unique optimizer IDs
+    base_id = int(time.time())
+    optimizer_id_constrained = f"chemical-reaction-constrained-{base_id}"
+    optimizer_id_unconstrained = f"chemical-reaction-unconstrained-{base_id}"
+    
+    # First run with constraints
+    print("\n\n======= RUNNING OPTIMIZATION WITH CONSTRAINTS =======\n")
+    print(f"Creating optimization with ID: {optimizer_id_constrained}")
+    
+    if create_optimization(optimizer_id_constrained, use_constraints=True):
+        initial_constrained = add_initial_measurements(optimizer_id_constrained, num_initial=5, with_constraints=True)
+        experiments_constrained = run_optimization(
+            optimizer_id_constrained, 
+            num_iterations=15,
+            initial_experiments=initial_constrained,
+            with_constraints=True
+        )
+        
+        # Get the best result
+        best_constrained = get_best_point(optimizer_id_constrained)
+        
+        # Then run without constraints
+        print("\n\n======= RUNNING OPTIMIZATION WITHOUT CONSTRAINTS =======\n")
+        print(f"Creating optimization with ID: {optimizer_id_unconstrained}")
+        
+        if create_optimization(optimizer_id_unconstrained, use_constraints=False):
+            initial_unconstrained = add_initial_measurements(optimizer_id_unconstrained, num_initial=5, with_constraints=False)
+            experiments_unconstrained = run_optimization(
+                optimizer_id_unconstrained, 
+                num_iterations=15,
+                initial_experiments=initial_unconstrained,
+                with_constraints=False
+            )
+            
+            # Get the best result
+            best_unconstrained = get_best_point(optimizer_id_unconstrained)
+            
+            # Compare results
+            print("\n\n======= COMPARISON OF RESULTS =======\n")
+            
+            if "best_parameters" in best_constrained and "best_parameters" in best_unconstrained:
+                print("Best results with constraints:")
+                print(f"  Parameters: {best_constrained['best_parameters']}")
+                print(f"  Yield: {best_constrained['best_value']:.2f}%")
+                
+                print("\nBest results without constraints:")
+                print(f"  Parameters: {best_unconstrained['best_parameters']}")
+                print(f"  Yield: {best_unconstrained['best_value']:.2f}%")
+                
+                # Check if unconstrained result violates constraints
+                unconstrained_best = best_unconstrained['best_parameters']
+                violations = []
+                
+                # Check temperature/pressure constraint
+                temp = unconstrained_best['Temperature']
+                press = unconstrained_best['Pressure']
+                if temp/120 + press/5 > 1.7:
+                    violations.append("temperature-pressure constraint")
+                    
+                # Check water-temperature constraint
+                if unconstrained_best['Solvent'] == 'Water' and temp >= 100:
+                    violations.append("water-temperature constraint")
+                    
+                # Check temperature-time constraint
+                if temp < 80 and unconstrained_best['Time'] < 60:
+                    violations.append("temperature-time constraint")
+                
+                if violations:
+                    print(f"\nWarning: Unconstrained best result violates {', '.join(violations)}")
+                    print("This demonstrates the importance of constraints for realistic optimizations.")
+                else:
+                    print("\nInterestingly, the unconstrained best result respects all constraints.")
+                
+                # Plot results
+                print("\nPlotting constrained optimization results...")
+                plot_results(experiments_constrained, with_constraints=True)
+                
+                print("\nPlotting unconstrained optimization results...")
+                plot_results(experiments_unconstrained, with_constraints=False)
+                
+                return {
+                    "constrained": {
+                        "experiments": experiments_constrained,
+                        "best": best_constrained
+                    },
+                    "unconstrained": {
+                        "experiments": experiments_unconstrained,
+                        "best": best_unconstrained
+                    }
+                }
+            
+    return None
 
 # Main execution
 if __name__ == "__main__":
-    print("=== Bayesian Optimization API Test Client ===")
+    print("=== Bayesian Optimization API Test Client with Constraints ===")
     
     # Check if the API is healthy and using GPU
     using_gpu = test_health()
     print(f"\nAPI using GPU acceleration: {using_gpu}")
     
-    # Generate a unique optimizer ID
-    optimizer_id = f"chemical-reaction-{int(time.time())}"
-    print(f"\nCreating optimization with ID: {optimizer_id}")
+    # Ask if user wants to run comparison or single experiment
+    run_comparison = input("\nRun comparison between constrained and unconstrained optimization? (y/n): ").lower().startswith('y')
     
-    # Create the optimization
-    if create_optimization(optimizer_id):
-        # Add initial measurements first (before requesting recommendations)
-        initial_experiments = add_initial_measurements(optimizer_id, num_initial=5)
+    if run_comparison:
+        results = run_comparative_experiment()
+    else:
+        # Generate a unique optimizer ID
+        optimizer_id = f"chemical-reaction-{int(time.time())}"
+        use_constraints = input("Use constraints? (y/n): ").lower().startswith('y')
+        print(f"\nCreating optimization with ID: {optimizer_id}")
         
-        # Then run the optimization loop
-        all_experiments = run_optimization(
-            optimizer_id, 
-            num_iterations=15,  # Reduced from 20 to 15 since we're adding 5 initial points
-            initial_experiments=initial_experiments
-        )
-        
-        # Print summary of all experiments
-        print("\n=== Experiment Summary ===")
-        print(f"{'Iter #':<6} {'Temp (°C)':<10} {'Pressure (bar)':<14} {'Time (min)':<10} {'Catalyst':<10} {'Solvent':<10} {'Yield (%)':<10}")
-        print("-" * 75)
-        for exp in all_experiments:
-            print(f"{exp['iteration']:<6} {exp['temperature']:<10} {exp['pressure']:<14} {exp['time']:<10} {exp['catalyst']:<10} {exp['solvent']:<10} {exp['yield']:.2f}")
-        
-        # Get the best result
-        best = get_best_point(optimizer_id)
-        if best and "best_parameters" in best:
-            print("\n=== Best Result ===")
-            print(f"Best parameters: {best['best_parameters']}")
-            print(f"Best yield: {best['best_value']:.2f}%")
+        # Create the optimization
+        if create_optimization(optimizer_id, use_constraints=use_constraints):
+            # Add initial measurements first (before requesting recommendations)
+            initial_experiments = add_initial_measurements(optimizer_id, num_initial=5, with_constraints=use_constraints)
             
-            # Plot the results
-            plot_results(all_experiments)
+            # Then run the optimization loop
+            all_experiments = run_optimization(
+                optimizer_id, 
+                num_iterations=15,
+                initial_experiments=initial_experiments,
+                with_constraints=use_constraints
+            )
+            
+            # Print summary of all experiments
+            print("\n=== Experiment Summary ===")
+            print(f"{'Iter #':<6} {'Temp (°C)':<10} {'Pressure (bar)':<14} {'Time (min)':<10} {'Catalyst':<10} {'Solvent':<10} {'Yield (%)':<10}")
+            print("-" * 75)
+            for exp in all_experiments:
+                print(f"{exp['iteration']:<6} {exp['temperature']:<10} {exp['pressure']:<14} {exp['time']:<10} {exp['catalyst']:<10} {exp['solvent']:<10} {exp['yield']:.2f}")
+            
+            # Get the best result
+            best = get_best_point(optimizer_id)
+            if best and "best_parameters" in best:
+                print("\n=== Best Result ===")
+                print(f"Best parameters: {best['best_parameters']}")
+                print(f"Best yield: {best['best_value']:.2f}%")
+                
+                # Plot the results
+                plot_results(all_experiments, with_constraints=use_constraints)
     
     print("\nTest client execution completed.")

@@ -49,6 +49,7 @@ def test_baybe_gpu():
         from baybe.parameters import NumericalDiscreteParameter
         from baybe.targets import NumericalTarget
         from baybe.recommenders import BotorchRecommender
+        import pandas as pd
         
         print("\n===== BayBE GPU Test =====")
         
@@ -62,7 +63,13 @@ def test_baybe_gpu():
         target = NumericalTarget(name="y", mode="MAX")
         objective = SingleTargetObjective(target=target)
         
-        # Create the campaign with a BotorchRecommender
+        # Create initial training data
+        initial_data = pd.DataFrame({
+            "x": [0.1, 0.9],
+            "y": [0.1, 0.8]  # Some initial measurements
+        })
+        
+        # Create the campaign with a BotorchRecommender and initial data
         recommender = BotorchRecommender()
         campaign = Campaign(
             searchspace=searchspace,
@@ -70,9 +77,12 @@ def test_baybe_gpu():
             recommender=recommender
         )
         
-        # Get initial recommendations
+        # Add initial measurements to the campaign
+        campaign.add_measurements(initial_data)
+        
+        # Get recommendations
         recommendations = campaign.recommend(batch_size=2)
-        print(f"Initial recommendations:\n{recommendations}")
+        print(f"Recommendations after initial data:\n{recommendations}")
         
         # Simulate a measurement (simple quadratic function)
         measurements = recommendations.copy()

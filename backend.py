@@ -6,6 +6,23 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 import torch
 from baybe import Campaign
 from baybe.searchspace import SearchSpace
+from baybe.constraints.base import Constraint
+from baybe.constraints import (
+    ContinuousLinearConstraint,
+    ContinuousCardinalityConstraint,
+    DiscreteCardinalityConstraint,
+    DiscreteCustomConstraint,
+    DiscreteDependenciesConstraint,
+    DiscreteExcludeConstraint,
+    DiscreteLinkedParametersConstraint,
+    DiscreteNoLabelDuplicatesConstraint,
+    DiscretePermutationInvarianceConstraint,
+    DiscreteProductConstraint,
+    DiscreteSumConstraint,
+    SubSelectionCondition,
+    ThresholdCondition,
+    validate_constraints
+)
 from baybe.objectives import SingleTargetObjective, DesirabilityObjective
 from baybe.parameters import (
     NumericalDiscreteParameter, 
@@ -60,6 +77,7 @@ class BayesianOptimizationBackend:
         optimizer_id: str,
         parameters: List[Dict[str, Any]],
         target_config: Dict[str, Any],
+        constraints: Optional[List[Dict[str, Any]]] = None,
         recommender_config: Optional[Dict[str, Any]] = None
     ) -> Dict[str, str]:
         """Create a new optimization process.
@@ -68,13 +86,15 @@ class BayesianOptimizationBackend:
             optimizer_id: Unique identifier for this optimization.
             parameters: List of parameter configurations.
             target_config: Configuration for the optimization target.
+            constraints: Optional list of constraint configurations.
             recommender_config: Optional recommender configuration.
             
         Returns:
             Dictionary with status information.
         """
-        # Parse parameters
+        # 1. Parameter Parsing and Instantiation
         parsed_parameters = []
+        
         for param_config in parameters:
             param_config = param_config.copy()  # Create a copy to avoid modifying the original
             param_type = param_config.pop("type")
@@ -89,11 +109,68 @@ class BayesianOptimizationBackend:
                 param = SubstanceParameter(**param_config)
             else:
                 raise ValueError(f"Unknown parameter type: {param_type}")
-            parsed_parameters.append(param)
             
-        # Create search space
-        searchspace = SearchSpace.from_product(parsed_parameters)
+            parsed_parameters.append(param)
         
+        # 2. Constraints Processing
+        parsed_constraints = []
+        if constraints:
+            for constraint_config in constraints:
+                constraint_config = constraint_config.copy()  # Create a copy to avoid modifying the original
+                constraint_type = constraint_config.pop("type")
+                
+                # Map constraint type to the appropriate class
+                constraint_class = self._get_constraint_class(constraint_type)
+                
+                # Process condition if needed
+                if "condition" in constraint_config:
+                    condition_config = constraint_config.pop("condition")
+                    condition_type = condition_config.pop("type", None)
+                    
+                    if condition_type == "Threshold":
+                        constraint_config["condition"] = ThresholdCondition(**condition_config)
+                    elif condition_type == "SubSelection":
+                        constraint_config["condition"] = SubSelectionCondition(**condition_config)
+                
+                # Process conditions if needed (for constraints that take multiple conditions)
+                if "conditions" in constraint_config and isinstance(constraint_config["conditions"], list):
+                    processed_conditions = []
+                    for cond in constraint_config["conditions"]:
+                        cond_copy = cond.copy()  # Create a copy to avoid modifying the original
+                        cond_type = cond_copy.pop("type", None)
+                        if cond_type == "Threshold":
+                            processed_conditions.append(ThresholdCondition(**cond_copy))
+                        elif cond_type == "SubSelection":
+                            processed_conditions.append(SubSelectionCondition(**cond_copy))
+                    constraint_config["conditions"] = processed_conditions
+                    
+                # Remove any non-essential fields that might confuse the constraint constructor
+                if "description" in constraint_config:
+                    constraint_config.pop("description")
+                
+                # Create the constraint instance
+                try:
+                    constraint = constraint_class(**constraint_config)
+                    parsed_constraints.append(constraint)
+                except Exception as e:
+                    raise ValueError(f"Error creating constraint of type {constraint_type}: {str(e)}")
+        
+        # 3. Validate constraints against parameters
+        if parsed_constraints:
+            try:
+                validate_constraints(parsed_constraints, parsed_parameters)
+            except Exception as e:
+                return {"status": "error", "message": f"Constraint validation failed: {str(e)}"}
+        
+        # 4. SearchSpace Creation with Structure and Constraints
+        try:
+            searchspace = SearchSpace.from_product(
+                parameters=parsed_parameters,
+                constraints=parsed_constraints if parsed_constraints else None
+            )
+        except Exception as e:
+            return {"status": "error", "message": f"Error creating search space: {str(e)}"}
+            
         # Parse target
         target_name = target_config.get("name", "Target")
         target_mode = target_config.get("mode", "MAX")
@@ -164,7 +241,46 @@ class BayesianOptimizationBackend:
         self.active_campaigns[optimizer_id] = campaign
         self.save_campaign(optimizer_id)
         
-        return {"status": "success", "message": "Optimization created"}
+        return {
+            "status": "success", 
+            "message": "Optimization created",
+            "constraint_count": len(parsed_constraints) if constraints else 0
+        }
+    
+    def _get_constraint_class(self, constraint_type: str) -> type:
+        """Map constraint type string to the appropriate constraint class.
+        
+        Args:
+            constraint_type: String identifier for the constraint type.
+            
+        Returns:
+            The corresponding constraint class.
+            
+        Raises:
+            ValueError: If the constraint type is unknown.
+        """
+        constraint_map = {
+            "ContinuousLinear": ContinuousLinearConstraint,
+            "Linear": ContinuousLinearConstraint,  # Alias for backward compatibility
+            "ContinuousCardinality": ContinuousCardinalityConstraint,
+            "DiscreteCardinality": DiscreteCardinalityConstraint, 
+            "DiscreteCustom": DiscreteCustomConstraint,
+            "DiscreteDependencies": DiscreteDependenciesConstraint,
+            "DiscreteExclude": DiscreteExcludeConstraint,
+            "DiscreteLinkedParameters": DiscreteLinkedParametersConstraint,
+            "DiscreteNoLabelDuplicates": DiscreteNoLabelDuplicatesConstraint,
+            "DiscretePermutationInvariance": DiscretePermutationInvarianceConstraint,
+            "DiscreteProduct": DiscreteProductConstraint,
+            "DiscreteSum": DiscreteSumConstraint,
+            
+            # Map the generic "Nonlinear" type to DiscreteExclude for backward compatibility
+            "Nonlinear": DiscreteExcludeConstraint
+        }
+        
+        if constraint_type not in constraint_map:
+            raise ValueError(f"Unknown constraint type: {constraint_type}. Available types: {list(constraint_map.keys())}")
+        
+        return constraint_map[constraint_type]
     
     def suggest_next_point(
         self, 
