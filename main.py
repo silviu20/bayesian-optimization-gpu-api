@@ -1,70 +1,161 @@
-import os
-from fastapi import FastAPI, HTTPException, Depends, Security
-from fastapi.security.api_key import APIKeyHeader, APIKey
-from starlette.status import HTTP_403_FORBIDDEN
-from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
-from dotenv import load_dotenv
-import pandas as pd
+# main.py
+from fastapi import FastAPI, HTTPException, Depends
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from typing import List, Dict, Any, Optional, Union
 import torch
+import os
+import json
+import pandas as pd
+from pathlib import Path
 
-# Import the updated GPU-enabled BayesianOptimizationBackend class
+# Import the Bayesian Optimization backend
+# Update the import to match your actual module name
 from backend import BayesianOptimizationBackend
 
-# Load environment variables
-load_dotenv()
+# Import the insights module
+from insights_router import insights_router
 
-# Get API key and GPU configuration from environment
-API_KEY = os.getenv("API_KEY", "your-default-api-key")
-USE_GPU = os.getenv("USE_GPU", "true").lower() == "true"
+# Initialize the FastAPI app
+app = FastAPI(
+    title="BayBE API", 
+    description="Bayesian Optimization Backend API",
+    version="1.0.0"
+)
 
-# Log GPU information on startup
-if USE_GPU:
-    if torch.cuda.is_available():
-        print(f"GPU ENABLED: {torch.cuda.get_device_name(0)}")
-        print(f"CUDA version: {torch.version.cuda}")
-        print(f"PyTorch version: {torch.__version__}")
-    else:
-        print("WARNING: GPU requested but not available. Using CPU instead.")
-else:
-    print("GPU DISABLED: Using CPU for computations")
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins in development
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods
+    allow_headers=["*"],  # Allows all headers
+)
 
-app = FastAPI(title="Bayesian Optimization API (GPU-enabled)")
-backend = BayesianOptimizationBackend(storage_path="/data", use_gpu=USE_GPU)
+app.include_router(insights_router)
 
-# API Key authentication
-API_KEY_NAME = "X-API-Key"
-api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+# Create a global instance of the BayesianOptimizationBackend
+storage_path = os.environ.get("STORAGE_PATH", "./data")
+use_gpu = os.environ.get("USE_GPU", "True").lower() == "true"
+bo_backend = BayesianOptimizationBackend(storage_path=storage_path, use_gpu=use_gpu)
 
-async def get_api_key(api_key_header: str = Security(api_key_header)):
-    if api_key_header == API_KEY:
-        return api_key_header
-    raise HTTPException(
-        status_code=HTTP_403_FORBIDDEN, detail="Invalid API Key"
-    )
+# Pydantic models for request/response schemas
+class Parameter(BaseModel):
+    name: str
+    type: str
+    values: Optional[List[Union[int, float, str]]] = None
+    bounds: Optional[List[float]] = None
+    encoding: Optional[str] = None
+    tolerance: Optional[float] = None
 
-# Pydantic models
+class TargetConfig(BaseModel):
+    name: str
+    mode: str = "MAX"
+    bounds: Optional[Dict[str, float]] = None
+    type: Optional[str] = None
+    weight: Optional[float] = None
+
+class Condition(BaseModel):
+    type: str
+    threshold: Optional[float] = None
+    parameter: Optional[str] = None
+    values: Optional[List[Any]] = None
+
+class Constraint(BaseModel):
+    type: str
+    parameters: Optional[List[str]] = None
+    conditions: Optional[List[Condition]] = None
+    condition: Optional[Condition] = None
+    weight: Optional[float] = None
+    constraint_func: Optional[str] = None
+    description: Optional[str] = None
+
+class SurrogateConfig(BaseModel):
+    type: str
+    kernel: Optional[Dict[str, Any]] = None
+    normalize_targets: Optional[bool] = None
+
+class AcquisitionConfig(BaseModel):
+    type: str
+    beta: Optional[float] = None
+
+class RecommenderConfig(BaseModel):
+    type: str
+    initial_recommender: Optional[Dict[str, Any]] = None
+    recommender: Optional[Dict[str, Any]] = None
+    n_restarts: Optional[int] = None
+    n_raw_samples: Optional[int] = None
+    switch_after: Optional[int] = None
+    remain_switched: Optional[bool] = None
+
 class OptimizationConfig(BaseModel):
-    parameters: List[Dict[str, Any]]
-    target_config: Dict[str, Any]
-    recommender_config: Optional[Dict[str, Any]] = None
+    parameters: List[Parameter]
+    target_config: Union[TargetConfig, List[TargetConfig]]
+    recommender_config: Optional[RecommenderConfig] = None
+    constraints: Optional[List[Constraint]] = None
+    objective_type: Optional[str] = "SingleTarget"
+    surrogate_config: Optional[SurrogateConfig] = None
+    acquisition_config: Optional[AcquisitionConfig] = None
 
-class MeasurementInput(BaseModel):
+class Measurement(BaseModel):
     parameters: Dict[str, Any]
     target_value: float
 
-class MultipleInput(BaseModel):
+class Measurements(BaseModel):
     measurements: List[Dict[str, Any]]
 
-# Endpoints with API key protection
-@app.post("/optimization/{optimizer_id}")
-def create_optimization(optimizer_id: str, config: OptimizationConfig, api_key: APIKey = Depends(get_api_key)):
-    """Create a new optimization process."""
-    result = backend.create_optimization(
+# Helper function to get optimizer or raise an exception if not found
+def get_optimizer(optimizer_id: str):
+    if optimizer_id in bo_backend.active_campaigns:
+        return bo_backend.active_campaigns[optimizer_id]
+    
+    # Try to load the optimizer
+    result = bo_backend.load_campaign(optimizer_id)
+    if result["status"] == "error":
+        raise HTTPException(status_code=404, detail=f"Optimizer not found: {optimizer_id}")
+    
+    return bo_backend.active_campaigns[optimizer_id]
+
+# Routes
+@app.get("/health")
+async def health_check():
+    """
+    Check the health status of the BayBE API and GPU availability
+    """
+    gpu_info = None
+    using_gpu = bo_backend.device.type == "cuda"
+    
+    if using_gpu:
+        # Get GPU info
+        gpu_info = {
+            "name": torch.cuda.get_device_name(0),
+            "memory_allocated_mb": torch.cuda.memory_allocated(0) / 1e6,
+            "memory_cached_mb": torch.cuda.memory_cached(0) / 1e6
+        }
+    
+    return {
+        "status": "ok",
+        "using_gpu": using_gpu,
+        "gpu_info": gpu_info
+    }
+
+@app.post("/optimizations/{optimizer_id}/create")
+async def create_optimization(optimizer_id: str, config: OptimizationConfig):
+    """
+    Create a new optimization process
+    """
+    # Convert Pydantic model to dictionary
+    config_dict = config.dict(exclude_unset=True)
+    
+    result = bo_backend.create_optimization(
         optimizer_id=optimizer_id,
-        parameters=config.parameters,
-        target_config=config.target_config,
-        recommender_config=config.recommender_config
+        parameters=config_dict["parameters"],
+        target_config=config_dict["target_config"],
+        constraints=config_dict.get("constraints"),
+        recommender_config=config_dict.get("recommender_config"),
+        objective_type=config_dict.get("objective_type", "SingleTarget"),
+        surrogate_config=config_dict.get("surrogate_config"),
+        acquisition_config=config_dict.get("acquisition_config")
     )
     
     if result["status"] == "error":
@@ -72,87 +163,144 @@ def create_optimization(optimizer_id: str, config: OptimizationConfig, api_key: 
     
     return result
 
-@app.get("/optimization/{optimizer_id}/suggest")
-def suggest_next_point(optimizer_id: str, batch_size: int = 1, api_key: APIKey = Depends(get_api_key)):
-    """Get the next suggested point(s) to evaluate."""
-    result = backend.suggest_next_point(optimizer_id, batch_size)
+@app.get("/optimizations/{optimizer_id}/suggest")
+async def suggest_next_point(optimizer_id: str, batch_size: int = 1):
+    """
+    Get suggested next point(s) to evaluate
+    """
+    # Make sure the optimizer exists
+    get_optimizer(optimizer_id)
+    
+    result = bo_backend.suggest_next_point(
+        optimizer_id=optimizer_id,
+        batch_size=batch_size
+    )
     
     if result["status"] == "error":
-        raise HTTPException(status_code=404, detail=result["message"])
+        raise HTTPException(status_code=400, detail=result["message"])
     
     return result
 
-@app.post("/optimization/{optimizer_id}/measurement")
-def add_measurement(optimizer_id: str, measurement: MeasurementInput, api_key: APIKey = Depends(get_api_key)):
-    """Add a new measurement to the optimizer."""
-    result = backend.add_measurement(
+@app.post("/optimizations/{optimizer_id}/measurement")
+async def add_measurement(optimizer_id: str, measurement: Measurement):
+    """
+    Add a new measurement to the optimizer
+    """
+    # Make sure the optimizer exists
+    get_optimizer(optimizer_id)
+    
+    result = bo_backend.add_measurement(
         optimizer_id=optimizer_id,
         parameters=measurement.parameters,
         target_value=measurement.target_value
     )
     
     if result["status"] == "error":
-        raise HTTPException(status_code=404, detail=result["message"])
+        raise HTTPException(status_code=400, detail=result["message"])
     
     return result
 
-@app.post("/optimization/{optimizer_id}/measurements")
-def add_multiple_measurements(optimizer_id: str, input_data: MultipleInput, api_key: APIKey = Depends(get_api_key)):
-    """Add multiple measurements at once."""
-    # Convert to dataframe
-    df = pd.DataFrame(input_data.measurements)
+@app.post("/optimizations/{optimizer_id}/measurements")
+async def add_multiple_measurements(optimizer_id: str, data: Measurements):
+    """
+    Add multiple measurements at once
+    """
+    # Make sure the optimizer exists
+    get_optimizer(optimizer_id)
     
-    result = backend.add_multiple_measurements(
+    # Create a DataFrame from the measurements
+    measurements_df = pd.DataFrame(data.measurements)
+    
+    result = bo_backend.add_multiple_measurements(
         optimizer_id=optimizer_id,
-        measurements=df
+        measurements=measurements_df
     )
     
     if result["status"] == "error":
-        raise HTTPException(status_code=404, detail=result["message"])
+        raise HTTPException(status_code=400, detail=result["message"])
     
     return result
 
-@app.get("/optimization/{optimizer_id}/best")
-def get_best_point(optimizer_id: str, api_key: APIKey = Depends(get_api_key)):
-    """Get the current best point."""
-    result = backend.get_best_point(optimizer_id)
+@app.get("/optimizations/{optimizer_id}/best")
+async def get_best_point(optimizer_id: str):
+    """
+    Get the current best point
+    """
+    # Make sure the optimizer exists
+    get_optimizer(optimizer_id)
+    
+    result = bo_backend.get_best_point(optimizer_id=optimizer_id)
+    
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+    
+    return result
+
+@app.post("/optimizations/{optimizer_id}/load")
+async def load_optimization(optimizer_id: str):
+    """
+    Load an existing optimization from disk
+    """
+    result = bo_backend.load_campaign(optimizer_id)
     
     if result["status"] == "error":
         raise HTTPException(status_code=404, detail=result["message"])
     
     return result
 
-@app.get("/optimization/{optimizer_id}/load")
-def load_optimization(optimizer_id: str, api_key: APIKey = Depends(get_api_key)):
-    """Load an existing optimization."""
-    result = backend.load_campaign(optimizer_id)
+@app.get("/optimizations/{optimizer_id}/history")
+async def get_measurement_history(optimizer_id: str):
+    """
+    Get the measurement history for an optimization
+    """
+    # Make sure the optimizer exists
+    get_optimizer(optimizer_id)
+    
+    result = bo_backend.get_measurement_history(optimizer_id=optimizer_id)
     
     if result["status"] == "error":
-        raise HTTPException(status_code=404, detail=result["message"])
+        raise HTTPException(status_code=400, detail=result["message"])
     
     return result
 
-# Add a health check endpoint (no auth required)
-@app.get("/health")
-def health_check():
-    """Check API health status and GPU information."""
-    gpu_info = None
-    if USE_GPU and torch.cuda.is_available():
-        gpu_info = {
-            "name": torch.cuda.get_device_name(0),
-            "memory_allocated_mb": torch.cuda.memory_allocated(0) / 1e6,
-            "memory_reserved_mb": torch.cuda.memory_reserved(0) / 1e6,
-            "device_count": torch.cuda.device_count()
-        }
+@app.get("/optimizations/{optimizer_id}/info")
+async def get_campaign_info(optimizer_id: str):
+    """
+    Get information about a campaign
+    """
+    # Make sure the optimizer exists
+    get_optimizer(optimizer_id)
     
-    return {
-        "status": "healthy", 
-        "using_gpu": USE_GPU and torch.cuda.is_available(),
-        "gpu_info": gpu_info
-    }
+    result = bo_backend.get_campaign_info(optimizer_id=optimizer_id)
+    
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+    
+    return result
 
-# Document API with Swagger UI
-@app.get("/")
-def redirect_to_docs():
-    from fastapi.responses import RedirectResponse
-    return RedirectResponse(url="/docs")
+@app.get("/optimizations")
+async def list_optimizations():
+    """
+    List all available optimizations
+    """
+    result = bo_backend.list_optimizations()
+    
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=result["message"])
+    
+    return result
+
+@app.delete("/optimizations/{optimizer_id}")
+async def delete_optimization(optimizer_id: str):
+    """
+    Delete an optimization from memory (not from disk)
+    """
+    if optimizer_id in bo_backend.active_campaigns:
+        del bo_backend.active_campaigns[optimizer_id]
+        return {"status": "success", "message": f"Optimization {optimizer_id} removed from memory"}
+    else:
+        return {"status": "warning", "message": f"Optimization {optimizer_id} was not in memory"}
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

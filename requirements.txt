@@ -2,7 +2,7 @@ fastapi==0.103.1
 uvicorn==0.23.2
 pandas==2.1.0
 numpy==1.25.2
-baybe==0.12.2
+baybe==0.12.0
 pydantic==2.3.0
 python-dotenv==1.0.0
 # For CUDA support - this will install the CUDA-enabled version by default
@@ -16,3 +16,5 @@ requests==2.31.0
 # For diagnostics
 psutil==5.9.5
 nvidia-ml-py3==7.352.0
+
+shap==0.42.0

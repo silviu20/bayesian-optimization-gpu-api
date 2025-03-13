@@ -1,8 +1,11 @@
-import json
-import pandas as pd
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, Any
+#backend.py
 
+import json
+import logging
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple, Union, Any, Callable
+
+import pandas as pd
 import torch
 from baybe import Campaign
 from baybe.searchspace import SearchSpace
@@ -21,22 +24,41 @@ from baybe.constraints import (
     DiscreteSumConstraint,
     SubSelectionCondition,
     ThresholdCondition,
-    validate_constraints
+    validate_constraints,
+    ContinuousLinearConstraint
 )
-from baybe.objectives import SingleTargetObjective, DesirabilityObjective
+from baybe.objectives import (
+    SingleTargetObjective, 
+    DesirabilityObjective, 
+    # ParetoObjective - unreleased yet
+)
 from baybe.parameters import (
     NumericalDiscreteParameter, 
     NumericalContinuousParameter,
     CategoricalParameter,
     SubstanceParameter
 )
-from baybe.targets import NumericalTarget
+from baybe.targets import NumericalTarget, BinaryTarget
 from baybe.recommenders import (
     BotorchRecommender,
-    FPSRecommender, 
+    FPSRecommender,
+    RandomRecommender,
     TwoPhaseMetaRecommender
 )
+from baybe.surrogates import (
+    GaussianProcessSurrogate,
+    BayesianLinearSurrogate,
+    MeanPredictionSurrogate,
+    NGBoostSurrogate,
+    RandomForestSurrogate
+)
 
+# Set up logging
+logger = logging.getLogger(__name__)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 
 class BayesianOptimizationBackend:
     """A Bayesian Optimization backend using BayBE with GPU acceleration."""
@@ -47,6 +69,9 @@ class BayesianOptimizationBackend:
         Args:
             storage_path: Directory to store optimization data.
             use_gpu: Whether to use GPU acceleration if available.
+            
+        Returns:
+            None
         """
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
@@ -55,9 +80,9 @@ class BayesianOptimizationBackend:
         # Set up GPU if requested and available
         self.device = torch.device("cuda" if use_gpu and torch.cuda.is_available() else "cpu")
         if use_gpu and not torch.cuda.is_available():
-            print("WARNING: GPU requested but not available. Using CPU instead.")
+            logger.warning("GPU requested but not available. Using CPU instead.")
         else:
-            print(f"Using device: {self.device}")
+            logger.info(f"Using device: {self.device}")
             
         # Configure PyTorch to use the selected device
         if self.device.type == "cuda":
@@ -68,184 +93,62 @@ class BayesianOptimizationBackend:
             torch.backends.cudnn.benchmark = True
             
             # Log GPU information
-            print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-            print(f"Memory allocated: {torch.cuda.memory_allocated(0) / 1e6:.2f} MB")
-            print(f"Memory cached: {torch.cuda.memory_cached(0) / 1e6:.2f} MB")
-
-    def create_optimization(
-        self, 
-        optimizer_id: str,
-        parameters: List[Dict[str, Any]],
-        target_config: Dict[str, Any],
-        constraints: Optional[List[Dict[str, Any]]] = None,
-        recommender_config: Optional[Dict[str, Any]] = None
-    ) -> Dict[str, str]:
-        """Create a new optimization process.
+            logger.info(f"Using GPU: {torch.cuda.get_device_name(0)}")
+            logger.info(f"Memory allocated: {torch.cuda.memory_allocated(0) / 1e6:.2f} MB")
+            logger.info(f"Memory cached: {torch.cuda.memory_cached(0) / 1e6:.2f} MB")
+    
+    def _parse_parameter(self, param_config: Dict[str, Any]) -> Union[
+            NumericalDiscreteParameter, 
+            NumericalContinuousParameter,
+            CategoricalParameter,
+            SubstanceParameter
+        ]:
+        """Parse a parameter configuration into a Parameter object.
         
         Args:
-            optimizer_id: Unique identifier for this optimization.
-            parameters: List of parameter configurations.
-            target_config: Configuration for the optimization target.
-            constraints: Optional list of constraint configurations.
-            recommender_config: Optional recommender configuration.
+            param_config: Parameter configuration dictionary.
             
         Returns:
-            Dictionary with status information.
+            The corresponding parameter object.
+            
+        Raises:
+            ValueError: If the parameter type is unknown.
         """
-        # 1. Parameter Parsing and Instantiation
-        parsed_parameters = []
+        param_config = param_config.copy()  # Create a copy to avoid modifying the original
+        param_type = param_config.pop("type")
         
-        for param_config in parameters:
-            param_config = param_config.copy()  # Create a copy to avoid modifying the original
-            param_type = param_config.pop("type")
-            
-            if param_type == "NumericalDiscrete":
-                param = NumericalDiscreteParameter(**param_config)
-            elif param_type == "NumericalContinuous":
-                param = NumericalContinuousParameter(**param_config)
-            elif param_type in ["Categorical", "CategoricalParameter"]:  # Handle both formats
-                param = CategoricalParameter(**param_config)
-            elif param_type in ["Substance", "SubstanceParameter"]:  # Handle both formats
-                param = SubstanceParameter(**param_config)
-            else:
-                raise ValueError(f"Unknown parameter type: {param_type}")
-            
-            parsed_parameters.append(param)
-        
-        # 2. Constraints Processing
-        parsed_constraints = []
-        if constraints:
-            for constraint_config in constraints:
-                constraint_config = constraint_config.copy()  # Create a copy to avoid modifying the original
-                constraint_type = constraint_config.pop("type")
-                
-                # Map constraint type to the appropriate class
-                constraint_class = self._get_constraint_class(constraint_type)
-                
-                # Process condition if needed
-                if "condition" in constraint_config:
-                    condition_config = constraint_config.pop("condition")
-                    condition_type = condition_config.pop("type", None)
-                    
-                    if condition_type == "Threshold":
-                        constraint_config["condition"] = ThresholdCondition(**condition_config)
-                    elif condition_type == "SubSelection":
-                        constraint_config["condition"] = SubSelectionCondition(**condition_config)
-                
-                # Process conditions if needed (for constraints that take multiple conditions)
-                if "conditions" in constraint_config and isinstance(constraint_config["conditions"], list):
-                    processed_conditions = []
-                    for cond in constraint_config["conditions"]:
-                        cond_copy = cond.copy()  # Create a copy to avoid modifying the original
-                        cond_type = cond_copy.pop("type", None)
-                        if cond_type == "Threshold":
-                            processed_conditions.append(ThresholdCondition(**cond_copy))
-                        elif cond_type == "SubSelection":
-                            processed_conditions.append(SubSelectionCondition(**cond_copy))
-                    constraint_config["conditions"] = processed_conditions
-                    
-                # Remove any non-essential fields that might confuse the constraint constructor
-                if "description" in constraint_config:
-                    constraint_config.pop("description")
-                
-                # Create the constraint instance
-                try:
-                    constraint = constraint_class(**constraint_config)
-                    parsed_constraints.append(constraint)
-                except Exception as e:
-                    raise ValueError(f"Error creating constraint of type {constraint_type}: {str(e)}")
-        
-        # 3. Validate constraints against parameters
-        if parsed_constraints:
-            try:
-                validate_constraints(parsed_constraints, parsed_parameters)
-            except Exception as e:
-                return {"status": "error", "message": f"Constraint validation failed: {str(e)}"}
-        
-        # 4. SearchSpace Creation with Structure and Constraints
-        try:
-            searchspace = SearchSpace.from_product(
-                parameters=parsed_parameters,
-                constraints=parsed_constraints if parsed_constraints else None
-            )
-        except Exception as e:
-            return {"status": "error", "message": f"Error creating search space: {str(e)}"}
-            
-        # Parse target
-        target_name = target_config.get("name", "Target")
-        target_mode = target_config.get("mode", "MAX")
-        target = NumericalTarget(name=target_name, mode=target_mode)
-        
-        if target_config.get("bounds"):
-            target.bounds = target_config["bounds"]
-            
-        objective = SingleTargetObjective(target=target)
-        
-        # Setup recommender
-        if recommender_config is None:
-            # Create a recommender configuration optimized for GPU when available
-            if self.device.type == "cuda":
-                # Use more parallel processing for GPU
-                recommender = TwoPhaseMetaRecommender(
-                    initial_recommender=FPSRecommender(),
-                    recommender=BotorchRecommender(
-                        n_restarts=20,  # Increased for GPU
-                        n_raw_samples=128  # Increased for GPU
-                    )
-                )
-            else:
-                # Default configuration for CPU
-                recommender = TwoPhaseMetaRecommender(
-                    initial_recommender=FPSRecommender(),
-                    recommender=BotorchRecommender()
-                )
+        if param_type == "NumericalDiscrete":
+            return NumericalDiscreteParameter(**param_config)
+        elif param_type == "NumericalContinuous":
+            return NumericalContinuousParameter(**param_config)
+        elif param_type in ["Categorical", "CategoricalParameter"]:  # Handle both formats
+            return CategoricalParameter(**param_config)
+        elif param_type in ["Substance", "SubstanceParameter"]:  # Handle both formats
+            return SubstanceParameter(**param_config)
         else:
-            # Parse recommender config (simplified)
-            recommender_config = recommender_config.copy()  # Create a copy
-            recommender_type = recommender_config.pop("type", "TwoPhaseMetaRecommender")
-            if recommender_type == "TwoPhaseMetaRecommender":
-                if self.device.type == "cuda":
-                    # Optimize for GPU
-                    recommender = TwoPhaseMetaRecommender(
-                        initial_recommender=FPSRecommender(),
-                        recommender=BotorchRecommender(
-                            n_restarts=20,  # Increased for GPU
-                            n_raw_samples=128,  # Increased for GPU
-                            **recommender_config
-                        )
-                    )
-                else:
-                    recommender = TwoPhaseMetaRecommender(
-                        initial_recommender=FPSRecommender(),
-                        recommender=BotorchRecommender(**recommender_config)
-                    )
-            elif recommender_type == "BotorchRecommender":
-                if self.device.type == "cuda":
-                    # Update config with GPU optimizations
-                    if "n_restarts" not in recommender_config:
-                        recommender_config["n_restarts"] = 20
-                    if "n_raw_samples" not in recommender_config:
-                        recommender_config["n_raw_samples"] = 128
-                recommender = BotorchRecommender(**recommender_config)
-            else:
-                raise ValueError(f"Unknown recommender type: {recommender_type}")
+            raise ValueError(f"Unknown parameter type: {param_type}")
+    
+    def _process_condition(self, condition_config: Dict[str, Any]) -> Union[ThresholdCondition, SubSelectionCondition]:
+        """Process a condition configuration into a Condition object.
         
-        # Create campaign
-        campaign = Campaign(
-            searchspace=searchspace,
-            objective=objective,
-            recommender=recommender
-        )
+        Args:
+            condition_config: Condition configuration dictionary.
+            
+        Returns:
+            The corresponding condition object.
+            
+        Raises:
+            ValueError: If the condition type is unknown.
+        """
+        condition_config = condition_config.copy()
+        condition_type = condition_config.pop("type", None)
         
-        # Store campaign
-        self.active_campaigns[optimizer_id] = campaign
-        self.save_campaign(optimizer_id)
-        
-        return {
-            "status": "success", 
-            "message": "Optimization created",
-            "constraint_count": len(parsed_constraints) if constraints else 0
-        }
+        if condition_type == "Threshold":
+            return ThresholdCondition(**condition_config)
+        elif condition_type == "SubSelection":
+            return SubSelectionCondition(**condition_config)
+        else:
+            raise ValueError(f"Unknown condition type: {condition_type}")
     
     def _get_constraint_class(self, constraint_type: str) -> type:
         """Map constraint type string to the appropriate constraint class.
@@ -261,7 +164,7 @@ class BayesianOptimizationBackend:
         """
         constraint_map = {
             "ContinuousLinear": ContinuousLinearConstraint,
-            "Linear": ContinuousLinearConstraint,  # Alias for backward compatibility
+            # "Linear": ContinuousLinearConstraint,  # Alias for backward compatibility
             "ContinuousCardinality": ContinuousCardinalityConstraint,
             "DiscreteCardinality": DiscreteCardinalityConstraint, 
             "DiscreteCustom": DiscreteCustomConstraint,
@@ -272,15 +175,447 @@ class BayesianOptimizationBackend:
             "DiscretePermutationInvariance": DiscretePermutationInvarianceConstraint,
             "DiscreteProduct": DiscreteProductConstraint,
             "DiscreteSum": DiscreteSumConstraint,
-            
-            # Map the generic "Nonlinear" type to DiscreteExclude for backward compatibility
-            "Nonlinear": DiscreteExcludeConstraint
+            "ContinuousLinearConstraint": ContinuousLinearConstraint
+            # "LinearEquality": LinearEqualityConstraint,
+            # "LinearInequality": LinearInequalityConstraint,
+            # "Nonlinear": NonlinearConstraint,  # Map the generic "Nonlinear" type
         }
         
         if constraint_type not in constraint_map:
             raise ValueError(f"Unknown constraint type: {constraint_type}. Available types: {list(constraint_map.keys())}")
         
         return constraint_map[constraint_type]
+    
+    def _parse_constraint(self, 
+                          constraint_config: Dict[str, Any], 
+                          parameter_map: Optional[Dict[str, Any]] = None
+                         ) -> Constraint:
+        """Parse a constraint configuration into a Constraint object.
+        
+        Args:
+            constraint_config: Constraint configuration dictionary.
+            parameter_map: Optional dictionary mapping parameter names to parameter objects.
+            
+        Returns:
+            The corresponding constraint object.
+            
+        Raises:
+            ValueError: If the constraint type is unknown or configuration is invalid.
+        """
+        constraint_config = constraint_config.copy()
+        constraint_type = constraint_config.pop("type")
+        
+        # Get the constraint class
+        constraint_class = self._get_constraint_class(constraint_type)
+        
+        # Process parameters for constraints that reference parameters by name
+        if parameter_map is not None and "parameters" in constraint_config:
+            param_names = constraint_config.pop("parameters")
+            constraint_params = [parameter_map[name] for name in param_names]
+            constraint_config["parameters"] = constraint_params
+        
+        # Process condition if needed
+        if "condition" in constraint_config and isinstance(constraint_config["condition"], dict):
+            constraint_config["condition"] = self._process_condition(constraint_config["condition"])
+        
+        # Process conditions if needed (for constraints that take multiple conditions)
+        if "conditions" in constraint_config and isinstance(constraint_config["conditions"], list):
+            processed_conditions = []
+            for cond in constraint_config["conditions"]:
+                processed_conditions.append(self._process_condition(cond))
+            constraint_config["conditions"] = processed_conditions
+        
+        # Special handling for DiscreteCustomConstraint
+        if constraint_type == "DiscreteCustom" and "constraint_func" in constraint_config:
+            constraint_func_str = constraint_config.pop("constraint_func")
+            
+            # Security check for unsafe code
+            unsafe_keywords = ['__import__', 'eval', 'exec', 'open', 'os.', 'sys.', 'subprocess']
+            if any(keyword in constraint_func_str for keyword in unsafe_keywords):
+                raise ValueError("Unsafe keywords detected in constraint function")
+            
+            # Create a function from the string
+            try:
+                exec_locals = {}
+                exec(f"def constraint_func(params):\n{constraint_func_str}", {}, exec_locals)
+                constraint_func = exec_locals["constraint_func"]
+                constraint_config["constraint_func"] = constraint_func
+            except Exception as e:
+                raise ValueError(f"Error in constraint function: {str(e)}")
+        
+        # Remove any non-essential fields that might confuse the constraint constructor
+        if "description" in constraint_config:
+            constraint_config.pop("description")
+        
+        # Create the constraint instance
+        try:
+            return constraint_class(**constraint_config)
+        except Exception as e:
+            raise ValueError(f"Error creating constraint of type {constraint_type}: {str(e)}")
+    
+    def _parse_target(self, target_config: Dict[str, Any]) -> Union[NumericalTarget, BinaryTarget]:
+        """Parse a target configuration into a Target object.
+        
+        Args:
+            target_config: Target configuration dictionary.
+            
+        Returns:
+            The corresponding target object.
+        """
+        target_name = target_config.get("name", "Target")
+        target_mode = target_config.get("mode", "MAX")
+        
+        # Check if it's a binary target
+        if target_config.get("type") == "Binary":
+            target = BinaryTarget(name=target_name, mode=target_mode)
+        else:
+            target = NumericalTarget(name=target_name, mode=target_mode)
+            
+        if target_config.get("bounds"):
+            target.bounds = target_config["bounds"]
+            
+        return target
+    
+    def _configure_surrogate_model(self, config: Dict[str, Any]) -> Any:
+        """Configure a surrogate model based on provided configuration.
+        
+        Args:
+            config: Dictionary with surrogate model configuration.
+                Must contain 'type' key specifying the model type.
+                
+        Returns:
+            Configured surrogate model instance.
+            
+        Raises:
+            ValueError: If the surrogate model type is unknown.
+        """
+        config = config.copy()
+        model_type = config.pop("type", "GaussianProcess")
+        
+        if model_type == "GaussianProcess":
+            return GaussianProcessSurrogate(**config)
+        elif model_type == "BayesianLinear":
+            return BayesianLinearSurrogate(**config)
+        elif model_type == "MeanPrediction":
+            return MeanPredictionSurrogate(**config)
+        elif model_type == "NGBoost":
+            return NGBoostSurrogate(**config)
+        elif model_type == "RandomForest":
+            return RandomForestSurrogate(**config)
+        else:
+            raise ValueError(f"Unknown surrogate model type: {model_type}")
+    
+    def _configure_acquisition_function(self, 
+                                       config: Optional[Dict[str, Any]], 
+                                       objective_type: str
+                                      ) -> Dict[str, Any]:
+        """Configure an acquisition function based on provided configuration and objective type.
+        
+        Args:
+            config: Dictionary with acquisition function configuration or None.
+            objective_type: Type of the objective (SingleTarget, Desirability, (or Pareto - when available)).
+            
+        Returns:
+            Dictionary with acquisition function configuration.
+        """
+        if config is None:
+            config = {}
+        else:
+            config = config.copy()
+            
+        acq_type = config.pop("type", None)
+        
+        # If no acquisition function is specified, choose appropriate default based on objective type
+        if acq_type is None:
+            if objective_type == "Pareto":
+                return {"type": "qLogNoisyExpectedHypervolumeImprovement"}
+            else:
+                return {"type": "qLogExpectedImprovement"}  # Good default for most cases
+        
+        # Validate that the acquisition function is compatible with the objective type
+        if objective_type == "Pareto" and acq_type not in ["qLogNoisyExpectedHypervolumeImprovement"]:
+            raise ValueError(f"Acquisition function {acq_type} is not compatible with Pareto objectives")
+        
+        return {"type": acq_type, **config}
+    
+    def _configure_recommender(self, 
+                              config: Optional[Dict[str, Any]], 
+                              objective_type: str,
+                              surrogate_config: Optional[Dict[str, Any]] = None,
+                              acquisition_config: Optional[Dict[str, Any]] = None
+                             ) -> Any:
+        """Configure a recommender based on provided configuration.
+        
+        Args:
+            config: Dictionary with recommender configuration or None.
+            objective_type: Type of the objective (SingleTarget, Desirability, or Pareto).
+            surrogate_config: Optional surrogate model configuration.
+            acquisition_config: Optional acquisition function configuration.
+                
+        Returns:
+            Configured recommender instance.
+            
+        Raises:
+            ValueError: If the recommender type is unknown.
+        """
+        # Default to TwoPhaseMetaRecommender if not specified
+        if config is None:
+            recommender_type = "TwoPhaseMetaRecommender"
+            config = {}
+        else:
+            config = config.copy()
+            recommender_type = config.pop("type", "TwoPhaseMetaRecommender")
+        
+        # Configure surrogate model if provided
+        surrogate_model = None
+        if surrogate_config is not None:
+            surrogate_model = self._configure_surrogate_model(surrogate_config)
+        
+        # Configure acquisition function if provided
+        acquisition_function = None
+        if acquisition_config is not None:
+            acquisition_function = self._configure_acquisition_function(acquisition_config, objective_type)
+        
+        # Set GPU-optimized defaults if using CUDA
+        cuda_optimizations = {}
+        if self.device.type == "cuda":
+            cuda_optimizations = {
+                "n_restarts": 20,
+                "n_raw_samples": 128
+            }
+        
+        if recommender_type == "TwoPhaseMetaRecommender":
+            # Configure initial recommender (default to FPSRecommender)
+            initial_config = config.pop("initial_recommender", {"type": "FPSRecommender"})
+            if isinstance(initial_config, dict):
+                initial_type = initial_config.pop("type", "FPSRecommender")
+                
+                if initial_type == "FPSRecommender":
+                    initial_recommender = FPSRecommender(**initial_config)
+                elif initial_type == "RandomRecommender":
+                    initial_recommender = RandomRecommender(**initial_config)
+                else:
+                    raise ValueError(f"Unknown initial recommender type: {initial_type}")
+            else:
+                initial_recommender = initial_config
+            
+            # Configure main recommender (default to BotorchRecommender)
+            main_config = config.pop("recommender", {})
+            if isinstance(main_config, dict):
+                main_type = main_config.pop("type", "BotorchRecommender")
+                
+                if main_type == "BotorchRecommender":
+                    recommender_kwargs = {**cuda_optimizations, **main_config}
+                    
+                    # Add surrogate model and acquisition function if provided
+                    if surrogate_model is not None:
+                        recommender_kwargs["surrogate_model"] = surrogate_model
+                    if acquisition_function is not None:
+                        recommender_kwargs["acquisition_function"] = acquisition_function
+                        
+                    main_recommender = BotorchRecommender(**recommender_kwargs)
+                else:
+                    raise ValueError(f"Unknown main recommender type: {main_type}")
+            else:
+                main_recommender = main_config
+            
+            # Create meta-recommender
+            switch_after = config.pop("switch_after", 1)
+            remain_switched = config.pop("remain_switched", True)
+            
+            return TwoPhaseMetaRecommender(
+                initial_recommender=initial_recommender,
+                recommender=main_recommender,
+                switch_after=switch_after,
+                remain_switched=remain_switched,
+                **config
+            )
+        
+        elif recommender_type == "BotorchRecommender":
+            recommender_kwargs = {**cuda_optimizations, **config}
+            
+            # Add surrogate model and acquisition function if provided
+            if surrogate_model is not None:
+                recommender_kwargs["surrogate_model"] = surrogate_model
+            if acquisition_function is not None:
+                recommender_kwargs["acquisition_function"] = acquisition_function
+                
+            return BotorchRecommender(**recommender_kwargs)
+        
+        elif recommender_type == "FPSRecommender":
+            return FPSRecommender(**config)
+        
+        elif recommender_type == "RandomRecommender":
+            return RandomRecommender(**config)
+        
+        else:
+            raise ValueError(f"Unknown recommender type: {recommender_type}")
+    
+    def create_optimization(
+        self, 
+        optimizer_id: str,
+        parameters: List[Dict[str, Any]],
+        target_config: Union[Dict[str, Any], List[Dict[str, Any]]],
+        constraints: Optional[List[Dict[str, Any]]] = None,
+        recommender_config: Optional[Dict[str, Any]] = None,
+        objective_type: str = "SingleTarget",
+        surrogate_config: Optional[Dict[str, Any]] = None,
+        acquisition_config: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, str]:
+        """Create a new optimization process.
+        
+        Args:
+            optimizer_id: Unique identifier for this optimization.
+            parameters: List of parameter configurations.
+            target_config: Configuration for the optimization target(s).
+                Can be a single dict for single-objective or a list of dicts for multi-objective.
+            constraints: Optional list of constraint configurations.
+            recommender_config: Optional recommender configuration.
+            objective_type: Type of objective to use. One of:
+                - "SingleTarget": Single objective optimization
+                - "Desirability": Multiple objectives combined with weights
+                - "Pareto": True multi-objective optimization with Pareto front # when available
+            surrogate_config: Optional surrogate model configuration.
+            acquisition_config: Optional acquisition function configuration.
+            
+        Returns:
+            Dictionary with status information.
+            
+        Raises:
+            ValueError: If the parameters, constraints, or objective configuration is invalid.
+        """
+        try:
+            # 1. Parameter Parsing and Instantiation
+            parsed_parameters = []
+            parameter_map = {}  # For referencing parameters in constraints
+            
+            for param_config in parameters:
+                try:
+                    param = self._parse_parameter(param_config)
+                    parsed_parameters.append(param)
+                    parameter_map[param_config.get("name")] = param
+                except Exception as e:
+                    return {"status": "error", "message": f"Error parsing parameter: {str(e)}"}
+            
+            # 2. Constraints Processing
+            parsed_constraints = []
+            if constraints:
+                for constraint_config in constraints:
+                    try:
+                        constraint = self._parse_constraint(constraint_config, parameter_map)
+                        parsed_constraints.append(constraint)
+                    except Exception as e:
+                        return {"status": "error", "message": f"Error parsing constraint: {str(e)}"}
+            
+            # 3. Validate constraints against parameters
+            if parsed_constraints:
+                try:
+                    validate_constraints(parsed_constraints, parsed_parameters)
+                except Exception as e:
+                    return {"status": "error", "message": f"Constraint validation failed: {str(e)}"}
+            
+            # 4. SearchSpace Creation with Structure and Constraints
+            try:
+                searchspace = SearchSpace.from_product(
+                    parameters=parsed_parameters,
+                    constraints=parsed_constraints if parsed_constraints else None
+                )
+            except Exception as e:
+                return {"status": "error", "message": f"Error creating search space: {str(e)}"}
+            
+            # 5. Parse target(s) and create objective
+            if objective_type == "SingleTarget":
+                # For backward compatibility with single target case
+                if isinstance(target_config, list):
+                    # If a list is provided but SingleTarget is specified, use the first target
+                    target_config = target_config[0]
+                
+                try:
+                    target = self._parse_target(target_config)
+                    objective = SingleTargetObjective(target=target)
+                except Exception as e:
+                    return {"status": "error", "message": f"Error creating target: {str(e)}"}
+                
+            elif objective_type == "Desirability":
+                # For desirability, we need multiple targets
+                if not isinstance(target_config, list):
+                    return {"status": "error", "message": "For Desirability objective, target_config must be a list of targets"}
+                
+                try:
+                    targets = []
+                    weights = []
+                    
+                    for target_conf in target_config:
+                        target = self._parse_target(target_conf)
+                        targets.append(target)
+                        weights.append(target_conf.get("weight", 1.0))
+                    
+                    # Create desirability objective with the specified targets and weights
+                    objective = DesirabilityObjective(
+                        targets=targets, 
+                        weights=weights,
+                        mean_type=target_config[0].get("mean_type", "arithmetic")  # Get from first target or default
+                    )
+                except Exception as e:
+                    return {"status": "error", "message": f"Error creating desirability objective: {str(e)}"}
+                
+            # elif objective_type == "Pareto":
+            #     # For Pareto optimization
+            #     if not isinstance(target_config, list):
+            #         return {"status": "error", "message": "For Pareto objective, target_config must be a list of targets"}
+                
+            #     try:
+            #         targets = []
+                    
+            #         for target_conf in target_config:
+            #             target = self._parse_target(target_conf)
+            #             targets.append(target)
+                    
+            #         # Create Pareto objective with the specified targets
+            #         objective = ParetoObjective(targets=targets)
+            #     except Exception as e:
+            #         return {"status": "error", "message": f"Error creating Pareto objective: {str(e)}"}
+            # else:
+            #     return {"status": "error", "message": f"Unknown objective type: {objective_type}"}
+            
+            # 6. Configure recommender
+            try:
+                recommender = self._configure_recommender(
+                    recommender_config,
+                    objective_type,
+                    surrogate_config,
+                    acquisition_config
+                )
+            except Exception as e:
+                return {"status": "error", "message": f"Error configuring recommender: {str(e)}"}
+            
+            # 7. Create campaign
+            try:
+                campaign = Campaign(
+                    searchspace=searchspace,
+                    objective=objective,
+                    recommender=recommender
+                )
+            except Exception as e:
+                return {"status": "error", "message": f"Error creating campaign: {str(e)}"}
+            
+            # 8. Store campaign
+            self.active_campaigns[optimizer_id] = campaign
+            save_result = self.save_campaign(optimizer_id)
+            if save_result.get("status") == "error":
+                return save_result
+            
+            return {
+                "status": "success", 
+                "message": "Optimization created",
+                "optimizer_id": optimizer_id,
+                "parameter_count": len(parsed_parameters),
+                "constraint_count": len(parsed_constraints) if constraints else 0
+            }
+        
+        except Exception as e:
+            logger.error(f"Error creating optimization: {str(e)}", exc_info=True)
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
     
     def suggest_next_point(
         self, 
@@ -299,7 +634,9 @@ class BayesianOptimizationBackend:
             Dictionary with suggested points.
         """
         if optimizer_id not in self.active_campaigns:
-            return self._load_or_error(optimizer_id)
+            load_result = self._load_or_error(optimizer_id)
+            if load_result.get("status") == "error":
+                return load_result
         
         campaign = self.active_campaigns[optimizer_id]
         try:
@@ -312,9 +649,11 @@ class BayesianOptimizationBackend:
             
             return {
                 "status": "success",
-                "suggestions": suggestions.to_dict(orient="records")
+                "suggestions": suggestions.to_dict(orient="records"),
+                "batch_size": batch_size
             }
         except Exception as e:
+            logger.error(f"Error suggesting next point: {str(e)}", exc_info=True)
             return {"status": "error", "message": str(e)}
     
     def add_measurement(
@@ -334,7 +673,9 @@ class BayesianOptimizationBackend:
             Dictionary with status information.
         """
         if optimizer_id not in self.active_campaigns:
-            return self._load_or_error(optimizer_id)
+            load_result = self._load_or_error(optimizer_id)
+            if load_result.get("status") == "error":
+                return load_result
         
         campaign = self.active_campaigns[optimizer_id]
         
@@ -345,10 +686,13 @@ class BayesianOptimizationBackend:
         
         try:
             campaign.add_measurements(df)
-            self.save_campaign(optimizer_id)
+            save_result = self.save_campaign(optimizer_id)
+            if save_result.get("status") == "error":
+                return save_result
             
             return {"status": "success", "message": "Measurement added"}
         except Exception as e:
+            logger.error(f"Error adding measurement: {str(e)}", exc_info=True)
             return {"status": "error", "message": str(e)}
     
     def add_multiple_measurements(
@@ -366,16 +710,21 @@ class BayesianOptimizationBackend:
             Dictionary with status information.
         """
         if optimizer_id not in self.active_campaigns:
-            return self._load_or_error(optimizer_id)
+            load_result = self._load_or_error(optimizer_id)
+            if load_result.get("status") == "error":
+                return load_result
         
         campaign = self.active_campaigns[optimizer_id]
         
         try:
             campaign.add_measurements(measurements)
-            self.save_campaign(optimizer_id)
+            save_result = self.save_campaign(optimizer_id)
+            if save_result.get("status") == "error":
+                return save_result
             
             return {"status": "success", "message": f"{len(measurements)} measurements added"}
         except Exception as e:
+            logger.error(f"Error adding multiple measurements: {str(e)}", exc_info=True)
             return {"status": "error", "message": str(e)}
     
     def get_best_point(self, optimizer_id: str) -> Dict[str, Any]:
@@ -388,7 +737,9 @@ class BayesianOptimizationBackend:
             Dictionary with best point information.
         """
         if optimizer_id not in self.active_campaigns:
-            return self._load_or_error(optimizer_id)
+            load_result = self._load_or_error(optimizer_id)
+            if load_result.get("status") == "error":
+                return load_result
         
         campaign = self.active_campaigns[optimizer_id]
         
@@ -398,93 +749,63 @@ class BayesianOptimizationBackend:
                 "message": "No measurements yet"
             }
         
-        # Find the best measurement
-        target = campaign.targets[0]
-        target_name = target.name
-        measurements = campaign.measurements
-        
-        if target.mode == "MAX":
-            best_idx = measurements[target_name].idxmax()
-        else:  # MIN
-            best_idx = measurements[target_name].idxmin()
-            
-        best_row = measurements.loc[best_idx]
-        
-        return {
-            "status": "success",
-            "best_parameters": best_row.drop(target_name).to_dict(),
-            "best_value": best_row[target_name]
-        }
-    
-    def save_campaign(self, optimizer_id: str) -> None:
-        """Save the campaign state to disk.
-        
-        Args:
-            optimizer_id: Identifier for the optimization.
-        """
-        campaign = self.active_campaigns[optimizer_id]
-        file_path = self.storage_path / f"{optimizer_id}.json"
-        
-        # If using GPU, temporarily move to CPU for serialization to avoid CUDA tensor issues
-        if self.device.type == "cuda":
-            # This is a defensive approach since BayBE should handle this internally
-            # but we're adding it just to be sure
-            try:
-                torch.cuda.empty_cache()
-            except:
-                pass
-        
-        # Convert campaign to JSON
-        config_json = campaign.to_json()
-        
-        with open(file_path, 'w') as f:
-            f.write(config_json)
-    
-    def load_campaign(self, optimizer_id: str) -> Dict[str, str]:
-        """Load a campaign from disk.
-        
-        Args:
-            optimizer_id: Identifier for the optimization.
-            
-        Returns:
-            Dictionary with status information.
-        """
-        file_path = self.storage_path / f"{optimizer_id}.json"
-        
-        if not file_path.exists():
-            return {
-                "status": "error", 
-                "message": f"No saved campaign found for ID: {optimizer_id}"
-            }
-        
         try:
-            with open(file_path, 'r') as f:
-                config_json = f.read()
+            # Find the best measurement
+            target = campaign.targets[0]
+            target_name = target.name
+            measurements = campaign.measurements
             
-            campaign = Campaign.from_config(config_json)
-            self.active_campaigns[optimizer_id] = campaign
+            if target.mode == "MAX":
+                best_idx = measurements[target_name].idxmax()
+            else:  # MIN
+                best_idx = measurements[target_name].idxmin()
+                
+            best_row = measurements.loc[best_idx]
             
-            # If using GPU, ensure any models are on the right device
-            if self.device.type == "cuda":
-                # Models should automatically use the default tensor type we set
-                # This is a safeguard for any potential edge cases
-                torch.cuda.empty_cache()
-            
-            return {"status": "success", "message": "Campaign loaded"}
+            return {
+                "status": "success",
+                "best_parameters": best_row.drop(target_name).to_dict(),
+                "best_value": float(best_row[target_name]),
+                "total_measurements": len(measurements)
+            }
         except Exception as e:
-            return {"status": "error", "message": f"Error loading campaign: {str(e)}"}
+            logger.error(f"Error getting best point: {str(e)}", exc_info=True)
+            return {"status": "error", "message": str(e)}
     
-    def _load_or_error(self, optimizer_id: str) -> Dict[str, str]:
-        """Attempt to load a campaign or return an error.
+    def save_campaign(self, optimizer_id: str) -> Dict[str, str]:
+        """Save the campaign state to disk with comprehensive error handling.
         
         Args:
             optimizer_id: Identifier for the optimization.
             
         Returns:
-            Dictionary with status information.
+            Dictionary with status information and error details if applicable.
         """
-        result = self.load_campaign(optimizer_id)
-        if result["status"] == "success":
-            return result
-        else:
-            return {"status": "error", "message": f"Optimizer not found: {optimizer_id}"}
+        try:
+            campaign = self.active_campaigns[optimizer_id]
+            file_path = self.storage_path / f"{optimizer_id}.json"
+            
+            # If using GPU, temporarily move to CPU for serialization to avoid CUDA tensor issues
+            if self.device.type == "cuda":
+                # This is a defensive approach since BayBE should handle this internally
+                try:
+                    torch.cuda.empty_cache()
+                except Exception as e:
+                    logger.warning(f"Could not empty CUDA cache: {str(e)}")
+            
+            # Convert campaign to JSON
+            try:
+                config_json = campaign.to_json()
+            except Exception as e:
+                return {"status": "error", "message": f"Error serializing campaign: {str(e)}"}
+            
+            # Write to file with error handling
+            try:
+                with open(file_path, 'w') as f:
+                    f.write(config_json)
+                return {"status": "success", "message": "Campaign saved successfully"}
+            except Exception as e:
+                return {"status": "error", "message": f"Error writing campaign to disk: {str(e)}"}
+        except Exception as e:
+            logger.error(f"Error saving campaign: {str(e)}", exc_info=True)
+            return {"status": "error", "message": f"Unexpected error: {str(e)}"}
