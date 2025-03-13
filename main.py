@@ -16,6 +16,11 @@ from backend import BayesianOptimizationBackend
 # Import the insights module
 from insights_router import insights_router
 
+# Add these imports to the top of the file, after other imports
+from initialization import initialization_router
+
+
+
 # Initialize the FastAPI app
 app = FastAPI(
     title="BayBE API", 
@@ -33,6 +38,7 @@ app.add_middleware(
 )
 
 app.include_router(insights_router)
+app.include_router(initialization_router)
 
 # Create a global instance of the BayesianOptimizationBackend
 storage_path = os.environ.get("STORAGE_PATH", "./data")

@@ -27,6 +27,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy application code
 COPY backend.py main.py gpu_test.py .env ./
 COPY entrypoint.sh /app/entrypoint.sh
+COPY insights.py insights_router.py .env ./
+COPY initialization.py .env ./
+
 
 # Make entrypoint script executable
 RUN chmod +x /app/entrypoint.sh

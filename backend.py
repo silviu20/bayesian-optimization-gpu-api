@@ -1,4 +1,4 @@
-#backend.py
+# backend.py
 
 import json
 import logging
@@ -809,3 +809,184 @@ class BayesianOptimizationBackend:
         except Exception as e:
             logger.error(f"Error saving campaign: {str(e)}", exc_info=True)
             return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+    
+    # New methods added below
+    
+    def _load_or_error(self, optimizer_id: str) -> Dict[str, str]:
+        """Load a campaign or return an error message.
+        
+        Args:
+            optimizer_id: Identifier for the optimization.
+            
+        Returns:
+            Dictionary with status information.
+        """
+        # First, check if the campaign exists on disk
+        file_path = self.storage_path / f"{optimizer_id}.json"
+        if not file_path.exists():
+            return {"status": "error", "message": f"Optimizer {optimizer_id} not found"}
+        
+        # Try to load the campaign
+        try:
+            load_result = self.load_campaign(optimizer_id)
+            if load_result["status"] == "error":
+                return load_result
+            return {"status": "success", "message": f"Optimizer {optimizer_id} loaded successfully"}
+        except Exception as e:
+            logger.error(f"Error loading optimizer: {str(e)}", exc_info=True)
+            return {"status": "error", "message": f"Error loading optimizer: {str(e)}"}
+
+    def load_campaign(self, optimizer_id: str) -> Dict[str, str]:
+        """Load a campaign from disk.
+        
+        Args:
+            optimizer_id: Identifier for the optimization.
+            
+        Returns:
+            Dictionary with status information.
+        """
+        try:
+            file_path = self.storage_path / f"{optimizer_id}.json"
+            
+            if not file_path.exists():
+                return {"status": "error", "message": f"Optimizer not found: {optimizer_id}"}
+            
+            # Read the JSON file
+            with open(file_path, 'r') as f:
+                config_json = f.read()
+            
+            # Create campaign from JSON
+            from baybe import Campaign
+            campaign = Campaign.from_json(config_json)
+            
+            # Store in active campaigns
+            self.active_campaigns[optimizer_id] = campaign
+            
+            return {"status": "success", "message": f"Optimizer {optimizer_id} loaded successfully"}
+        except Exception as e:
+            logger.error(f"Error loading campaign: {str(e)}", exc_info=True)
+            return {"status": "error", "message": f"Error loading optimizer: {str(e)}"}
+
+    def get_measurement_history(self, optimizer_id: str) -> Dict[str, Any]:
+        """Get the measurement history for an optimization.
+        
+        Args:
+            optimizer_id: Identifier for the optimization.
+            
+        Returns:
+            Dictionary with measurement history.
+        """
+        if optimizer_id not in self.active_campaigns:
+            load_result = self._load_or_error(optimizer_id)
+            if load_result.get("status") == "error":
+                return {"status": "error", "message": load_result["message"]}
+        
+        campaign = self.active_campaigns[optimizer_id]
+        
+        if campaign.measurements.empty:
+            return {
+                "status": "success",
+                "message": "No measurements yet",
+                "measurements": []
+            }
+        
+        return {
+            "status": "success",
+            "measurements": campaign.measurements.to_dict(orient="records")
+        }
+
+    def get_campaign_info(self, optimizer_id: str) -> Dict[str, Any]:
+        """Get information about a campaign.
+        
+        Args:
+            optimizer_id: Identifier for the optimization.
+            
+        Returns:
+            Dictionary with campaign information.
+        """
+        if optimizer_id not in self.active_campaigns:
+            load_result = self._load_or_error(optimizer_id)
+            if load_result.get("status") == "error":
+                return {"status": "error", "message": load_result["message"]}
+        
+        campaign = self.active_campaigns[optimizer_id]
+        
+        # Collect campaign information
+        info = {
+            "parameters": [],
+            "target": {},
+            "measurements_count": len(campaign.measurements) if hasattr(campaign, "measurements") else 0
+        }
+        
+        # Add parameter information
+        for param in campaign.searchspace.parameters:
+            param_info = {
+                "name": param.name,
+                "type": param.__class__.__name__
+            }
+            
+            if hasattr(param, "values") and param.values is not None:
+                param_info["values"] = param.values.tolist() if hasattr(param.values, 'tolist') else param.values
+            elif hasattr(param, "bounds") and param.bounds is not None:
+                param_info["bounds"] = [param.bounds.lower, param.bounds.upper]
+                
+            info["parameters"].append(param_info)
+        
+        # Add target information
+        target = campaign.targets[0]
+        info["target"] = {
+            "name": target.name,
+            "mode": target.mode
+        }
+        
+        if hasattr(target, "bounds") and target.bounds is not None:
+            info["target"]["bounds"] = [target.bounds.lower, target.bounds.upper]
+        
+        return {
+            "status": "success",
+            "info": info
+        }
+
+    def list_optimizations(self) -> Dict[str, Any]:
+        """List all available optimizations.
+        
+        Returns:
+            Dictionary with list of optimizations.
+        """
+        try:
+            # Get all JSON files in the storage directory
+            json_files = list(self.storage_path.glob("*.json"))
+            
+            # Extract optimizer IDs from filenames
+            optimizer_ids = [file.stem for file in json_files]
+            
+            # Get information for each optimizer
+            optimizers = []
+            
+            for optimizer_id in optimizer_ids:
+                # Try to load basic information without loading the entire campaign
+                try:
+                    file_path = self.storage_path / f"{optimizer_id}.json"
+                    
+                    with open(file_path, 'r') as f:
+                        # Read first few lines to extract basic info
+                        first_lines = "".join([f.readline() for _ in range(20)])
+                    
+                    # Check if it's a valid campaign file
+                    if "searchspace" in first_lines and "objective" in first_lines:
+                        optimizers.append({
+                            "id": optimizer_id,
+                            "file_path": str(file_path)
+                        })
+                except Exception as e:
+                    # Skip files that can't be parsed
+                    logger.warning(f"Could not parse file {file_path}: {str(e)}")
+                    pass
+            
+            return {
+                "status": "success",
+                "optimizers": optimizers
+            }
+        except Exception as e:
+            logger.error(f"Error listing optimizations: {str(e)}", exc_info=True)
+            return {"status": "error", "message": f"Error listing optimizations: {str(e)}"}
