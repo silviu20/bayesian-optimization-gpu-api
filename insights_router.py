@@ -1,3 +1,5 @@
+# insights_router.py
+
 """Router for Bayesian optimization insights endpoints."""
 
 from fastapi import APIRouter, HTTPException, Depends, Body

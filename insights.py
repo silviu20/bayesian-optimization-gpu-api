@@ -1,3 +1,5 @@
+#insights
+
 """Module for generating insights for Bayesian optimization experiments."""
 
 from typing import Dict, Any, List, Optional, Literal
