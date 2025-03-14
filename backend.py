@@ -327,14 +327,14 @@ class BayesianOptimizationBackend:
         
         # If no acquisition function is specified, choose appropriate default based on objective type
         if acq_type is None:
-            if objective_type == "Pareto":
-                return {"type": "qLogNoisyExpectedHypervolumeImprovement"}
-            else:
-                return {"type": "qLogExpectedImprovement"}  # Good default for most cases
+            # if objective_type == "Pareto":
+            #     return {"type": "qLogNoisyExpectedHypervolumeImprovement"}
+            # else:
+            return {"type": "qLogExpectedImprovement"}  # Good default for most cases
         
-        # Validate that the acquisition function is compatible with the objective type
-        if objective_type == "Pareto" and acq_type not in ["qLogNoisyExpectedHypervolumeImprovement"]:
-            raise ValueError(f"Acquisition function {acq_type} is not compatible with Pareto objectives")
+        # # Validate that the acquisition function is compatible with the objective type
+        # if objective_type == "Pareto" and acq_type not in ["qLogNoisyExpectedHypervolumeImprovement"]:
+        #     raise ValueError(f"Acquisition function {acq_type} is not compatible with Pareto objectives")
         
         return {"type": acq_type, **config}
     

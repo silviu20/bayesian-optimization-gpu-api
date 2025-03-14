@@ -6,6 +6,7 @@ import logging
 from typing import List, Dict, Any, Optional, Union
 from fastapi import APIRouter, HTTPException, Body, Depends, Query
 from pydantic import BaseModel, Field
+from pyDOE2 import lhs
 
 # Set up logging
 logger = logging.getLogger(__name__)
