@@ -150,7 +150,30 @@ def health_check():
         "using_gpu": USE_GPU and torch.cuda.is_available(),
         "gpu_info": gpu_info
     }
+# added new test here 02/04/2025
+@app.get("/test-optimization")
+def test_optimization():
+    """Test endpoint to check if the optimization process works."""
+    # Define some default or dummy parameters for testing
+    default_config = OptimizationConfig(
+        parameters={"param1": "value1"},
+        target_config={"target": "value"},
+        recommender_config={"recommender": "default"}
+    )
 
+    # Call the backend optimization function with a default optimizer ID
+    result = backend.create_optimization(
+        optimizer_id="default_optimizer",
+        parameters=default_config.parameters,
+        target_config=default_config.target_config,
+        recommender_config=default_config.recommender_config
+    )
+
+    if result["status"] == "error":
+        raise HTTPException(status_code=400, detail=result["message"])
+
+    return {"message": "Optimization test successful", "result": result}
+    
 # Document API with Swagger UI
 @app.get("/")
 def redirect_to_docs():
