@@ -1,4 +1,3 @@
-# main.py
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
@@ -19,11 +18,9 @@ from insights_router import insights_router
 # Add these imports to the top of the file, after other imports
 from initialization import initialization_router
 
-
-
 # Initialize the FastAPI app
 app = FastAPI(
-    title="BayBE API", 
+    title="BayBE API",
     description="Bayesian Optimization Backend API",
     version="1.0.0"
 )
@@ -114,14 +111,55 @@ class Measurements(BaseModel):
 def get_optimizer(optimizer_id: str):
     if optimizer_id in bo_backend.active_campaigns:
         return bo_backend.active_campaigns[optimizer_id]
-    
+
     # Try to load the optimizer
     result = bo_backend.load_campaign(optimizer_id)
     if result["status"] == "error":
         raise HTTPException(status_code=404, detail=f"Optimizer not found: {optimizer_id}")
-    
+
     return bo_backend.active_campaigns[optimizer_id]
 
+# Make sure this import or definition is present at the top of your file
+# If get_api_key is imported elsewhere, use the same import statement
+# For example:
+# from dependencies import get_api_key
+
+@app.get("/optimization/test")
+def test_optimization(API_KEY=123456789):
+    """Test if the optimization system is working correctly with default parameters."""
+    # Create a simple test configuration
+    test_config = OptimizationConfig(
+        parameters={
+            "test_param": {
+                "type": "float",
+                "min": 0.0,
+                "max": 1.0
+            }
+        },
+        target_config={"type": "maximize"},
+        recommender_config={"type": "random"}
+    )
+    
+    # Use a fixed test ID
+    test_id = "test_optimizer"
+    
+    # Try to create a test optimization
+    result = backend.create_optimization(
+        optimizer_id=test_id,
+        parameters=test_config.parameters,
+        target_config=test_config.target_config,
+        recommender_config=test_config.recommender_config
+    )
+    
+    if result["status"] == "error":
+        raise HTTPException(status_code=500, detail=f"Optimization test failed: {result['message']}")
+    
+    return {
+        "status": "success",
+        "message": "Optimization system is working correctly",
+        "test_details": result
+    }
+    
 # Routes
 @app.get("/health")
 async def health_check():
@@ -130,7 +168,7 @@ async def health_check():
     """
     gpu_info = None
     using_gpu = bo_backend.device.type == "cuda"
-    
+
     if using_gpu:
         # Get GPU info
         gpu_info = {
@@ -138,7 +176,7 @@ async def health_check():
             "memory_allocated_mb": torch.cuda.memory_allocated(0) / 1e6,
             "memory_cached_mb": torch.cuda.memory_cached(0) / 1e6
         }
-    
+
     return {
         "status": "ok",
         "using_gpu": using_gpu,
@@ -152,7 +190,7 @@ async def create_optimization(optimizer_id: str, config: OptimizationConfig):
     """
     # Convert Pydantic model to dictionary
     config_dict = config.dict(exclude_unset=True)
-    
+
     result = bo_backend.create_optimization(
         optimizer_id=optimizer_id,
         parameters=config_dict["parameters"],
@@ -163,10 +201,10 @@ async def create_optimization(optimizer_id: str, config: OptimizationConfig):
         surrogate_config=config_dict.get("surrogate_config"),
         acquisition_config=config_dict.get("acquisition_config")
     )
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
-    
+
     return result
 
 @app.get("/optimizations/{optimizer_id}/suggest")
@@ -176,15 +214,15 @@ async def suggest_next_point(optimizer_id: str, batch_size: int = 1):
     """
     # Make sure the optimizer exists
     get_optimizer(optimizer_id)
-    
+
     result = bo_backend.suggest_next_point(
         optimizer_id=optimizer_id,
         batch_size=batch_size
     )
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
-    
+
     return result
 
 @app.post("/optimizations/{optimizer_id}/measurement")
@@ -194,16 +232,16 @@ async def add_measurement(optimizer_id: str, measurement: Measurement):
     """
     # Make sure the optimizer exists
     get_optimizer(optimizer_id)
-    
+
     result = bo_backend.add_measurement(
         optimizer_id=optimizer_id,
         parameters=measurement.parameters,
         target_value=measurement.target_value
     )
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
-    
+
     return result
 
 @app.post("/optimizations/{optimizer_id}/measurements")
@@ -213,18 +251,18 @@ async def add_multiple_measurements(optimizer_id: str, data: Measurements):
     """
     # Make sure the optimizer exists
     get_optimizer(optimizer_id)
-    
+
     # Create a DataFrame from the measurements
     measurements_df = pd.DataFrame(data.measurements)
-    
+
     result = bo_backend.add_multiple_measurements(
         optimizer_id=optimizer_id,
         measurements=measurements_df
     )
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
-    
+
     return result
 
 @app.get("/optimizations/{optimizer_id}/best")
@@ -234,12 +272,12 @@ async def get_best_point(optimizer_id: str):
     """
     # Make sure the optimizer exists
     get_optimizer(optimizer_id)
-    
+
     result = bo_backend.get_best_point(optimizer_id=optimizer_id)
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
-    
+
     return result
 
 @app.post("/optimizations/{optimizer_id}/load")
@@ -248,10 +286,10 @@ async def load_optimization(optimizer_id: str):
     Load an existing optimization from disk
     """
     result = bo_backend.load_campaign(optimizer_id)
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=404, detail=result["message"])
-    
+
     return result
 
 @app.get("/optimizations/{optimizer_id}/history")
@@ -261,12 +299,12 @@ async def get_measurement_history(optimizer_id: str):
     """
     # Make sure the optimizer exists
     get_optimizer(optimizer_id)
-    
+
     result = bo_backend.get_measurement_history(optimizer_id=optimizer_id)
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
-    
+
     return result
 
 @app.get("/optimizations/{optimizer_id}/info")
@@ -276,12 +314,12 @@ async def get_campaign_info(optimizer_id: str):
     """
     # Make sure the optimizer exists
     get_optimizer(optimizer_id)
-    
+
     result = bo_backend.get_campaign_info(optimizer_id=optimizer_id)
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=400, detail=result["message"])
-    
+
     return result
 
 @app.get("/optimizations")
@@ -290,10 +328,10 @@ async def list_optimizations():
     List all available optimizations
     """
     result = bo_backend.list_optimizations()
-    
+
     if result["status"] == "error":
         raise HTTPException(status_code=500, detail=result["message"])
-    
+
     return result
 
 @app.delete("/optimizations/{optimizer_id}")
@@ -306,6 +344,18 @@ async def delete_optimization(optimizer_id: str):
         return {"status": "success", "message": f"Optimization {optimizer_id} removed from memory"}
     else:
         return {"status": "warning", "message": f"Optimization {optimizer_id} was not in memory"}
+
+@app.get("/")
+async def root():
+    """
+    Root endpoint with API information
+    """
+    return {
+        "name": "BayBE API",
+        "description": "Bayesian Optimization Backend API",
+        "version": "1.0.0",
+        "documentation_url": "/docs"
+    }
 
 if __name__ == "__main__":
     import uvicorn
